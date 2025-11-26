@@ -1,0 +1,7 @@
+README.md
+.env
+.env.example
+k8s-deployment.yaml
+.git
+.gitignore
+

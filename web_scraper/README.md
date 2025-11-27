@@ -1,26 +1,27 @@
-# Web Scraper with Discord Notifications
+# Web Scraper with Email Notifications
 
-A Go application that periodically scrapes a website for specific text and sends a Discord notification when a match is found.
+A Go application that periodically scrapes a website for specific text and sends an email notification when a match is found.
 
 ## Features
 
 - Scrapes website content for specified text
-- Sends Discord webhook notifications when matches are found
+- Sends email notifications when matches are found
+- Extracts and includes links to matching items
 - Configurable check interval
 - Environment variable configuration
 - Automatic `.env` file support
 
 ## Prerequisites
 
-- Go 1.19 or later
-- A Discord webhook URL
+- Go 1.18 or later
+- SMTP email server access (Gmail, Outlook, or custom SMTP server)
 
 ## Setup
 
-1. **Get a Discord Webhook URL:**
-   - Go to your Discord server settings
-   - Navigate to Integrations → Webhooks
-   - Create a new webhook and copy the webhook URL
+1. **Configure SMTP Email Settings:**
+   - For Gmail: Use `smtp.gmail.com` on port `587` with an [App Password](https://support.google.com/accounts/answer/185833)
+   - For Outlook: Use `smtp-mail.outlook.com` on port `587`
+   - For custom SMTP: Use your server's SMTP host and port
 
 2. **Install dependencies:**
    ```bash
@@ -31,17 +32,16 @@ A Go application that periodically scrapes a website for specific text and sends
 
    **Option A: Using a `.env` file (recommended):**
    
-   Create a `.env` file in the project directory (you can copy `.env.example` as a template):
-   ```bash
-   cp .env.example .env
-   # Then edit .env with your values
-   ```
-   
-   Or create it manually:
+   Create a `.env` file in the project directory:
    ```bash
    WEBSITE_URL=https://example.com
    SEARCH_TEXT=your search text
-   DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_USERNAME=your-email@gmail.com
+   SMTP_PASSWORD=your-app-password
+   EMAIL_FROM=your-email@gmail.com
+   EMAIL_TO=recipient@example.com
    CHECK_INTERVAL=5m
    ```
    
@@ -51,7 +51,12 @@ A Go application that periodically scrapes a website for specific text and sends
    ```bash
    export WEBSITE_URL="https://example.com"
    export SEARCH_TEXT="your search text"
-   export DISCORD_WEBHOOK="https://discord.com/api/webhooks/..."
+   export SMTP_HOST="smtp.gmail.com"
+   export SMTP_PORT="587"
+   export SMTP_USERNAME="your-email@gmail.com"
+   export SMTP_PASSWORD="your-app-password"
+   export EMAIL_FROM="your-email@gmail.com"
+   export EMAIL_TO="recipient@example.com"
    export CHECK_INTERVAL="5m"  # Optional, default is 5 minutes
    ```
 
@@ -66,7 +71,12 @@ A Go application that periodically scrapes a website for specific text and sends
 
 - `WEBSITE_URL` (required): The URL of the website to scrape
 - `SEARCH_TEXT` (required): The text to search for on the website
-- `DISCORD_WEBHOOK` (required): Your Discord webhook URL
+- `SMTP_HOST` (required): SMTP server hostname (e.g., `smtp.gmail.com`)
+- `SMTP_PORT` (required): SMTP server port (e.g., `587` for TLS, `465` for SSL)
+- `SMTP_USERNAME` (optional): SMTP username (required for authenticated SMTP)
+- `SMTP_PASSWORD` (optional): SMTP password or app password (required for authenticated SMTP)
+- `EMAIL_FROM` (required): Email address to send from
+- `EMAIL_TO` (required): Email address to send to
 - `CHECK_INTERVAL` (optional): How often to check the website (e.g., "5m", "1h", "30s"). Default: "5m"
 
 ### Check Interval Format
@@ -82,7 +92,12 @@ The `CHECK_INTERVAL` uses Go's duration format:
 ```bash
 export WEBSITE_URL="https://example.com/products"
 export SEARCH_TEXT="in stock"
-export DISCORD_WEBHOOK="https://discord.com/api/webhooks/123456789/abcdefgh"
+export SMTP_HOST="smtp.gmail.com"
+export SMTP_PORT="587"
+export SMTP_USERNAME="your-email@gmail.com"
+export SMTP_PASSWORD="your-app-password"
+export EMAIL_FROM="your-email@gmail.com"
+export EMAIL_TO="recipient@example.com"
 export CHECK_INTERVAL="1m"
 
 go run main.go
@@ -109,7 +124,12 @@ go build -o web_scraper
    docker run -d \
      -e WEBSITE_URL="https://example.com" \
      -e SEARCH_TEXT="your search text" \
-     -e DISCORD_WEBHOOK="https://discord.com/api/webhooks/..." \
+     -e SMTP_HOST="smtp.gmail.com" \
+     -e SMTP_PORT="587" \
+     -e SMTP_USERNAME="your-email@gmail.com" \
+     -e SMTP_PASSWORD="your-app-password" \
+     -e EMAIL_FROM="your-email@gmail.com" \
+     -e EMAIL_TO="recipient@example.com" \
      -e CHECK_INTERVAL="5m" \
      --name web-scraper \
      web-scraper:latest
@@ -120,41 +140,44 @@ go build -o web_scraper
    docker run -d --env-file .env --name web-scraper web-scraper:latest
    ```
 
-## Kubernetes Deployment
+## Email Provider Examples
 
-1. **Update the configuration files:**
-   - Edit `k8s-deployment.yaml` and update the ConfigMap with your `WEBSITE_URL`, `SEARCH_TEXT`, and `CHECK_INTERVAL`
-   - Update the Secret with your `DISCORD_WEBHOOK` (or use `kubectl create secret`)
+### Gmail
+```bash
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=your-email@gmail.com
+SMTP_PASSWORD=your-16-char-app-password  # Generate at https://myaccount.google.com/apppasswords
+EMAIL_FROM=your-email@gmail.com
+EMAIL_TO=recipient@example.com
+```
 
-2. **Build and push the Docker image:**
-   ```bash
-   docker build -t your-registry/web-scraper:latest .
-   docker push your-registry/web-scraper:latest
-   ```
+### Outlook/Hotmail
+```bash
+SMTP_HOST=smtp-mail.outlook.com
+SMTP_PORT=587
+SMTP_USERNAME=your-email@outlook.com
+SMTP_PASSWORD=your-password
+EMAIL_FROM=your-email@outlook.com
+EMAIL_TO=recipient@example.com
+```
 
-3. **Update the image in k8s-deployment.yaml:**
-   - Change `image: web-scraper:latest` to your image path
-
-4. **Create the Secret (if not using the one in the file):**
-   ```bash
-   kubectl create secret generic web-scraper-secrets \
-     --from-literal=DISCORD_WEBHOOK="https://discord.com/api/webhooks/..."
-   ```
-
-5. **Deploy to Kubernetes:**
-   ```bash
-   kubectl apply -f k8s-deployment.yaml
-   ```
-
-6. **Check the deployment:**
-   ```bash
-   kubectl get pods -l app=web-scraper
-   kubectl logs -l app=web-scraper
-   ```
+### Custom SMTP Server
+```bash
+SMTP_HOST=mail.example.com
+SMTP_PORT=587
+SMTP_USERNAME=your-username
+SMTP_PASSWORD=your-password
+EMAIL_FROM=noreply@example.com
+EMAIL_TO=recipient@example.com
+```
 
 ## Notes
 
 - The scraper performs case-insensitive text matching
 - The application runs continuously, checking at the specified interval
 - All text content from the website's body is searched
+- When a match is found, the email includes links to the matching items
+- For Gmail, you must use an [App Password](https://support.google.com/accounts/answer/185833) instead of your regular password
+- SMTP authentication is optional - if `SMTP_USERNAME` and `SMTP_PASSWORD` are not provided, the email will be sent without authentication (may not work with most providers)
 

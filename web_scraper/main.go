@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/smtp"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,14 +16,15 @@ import (
 )
 
 type Config struct {
-	WebsiteURL     string
-	SearchText     string
-	DiscordWebhook string
-	CheckInterval  time.Duration
-}
-
-type DiscordWebhook struct {
-	Content string `json:"content"`
+	WebsiteURL    string
+	SearchText    string
+	SMTPHost      string
+	SMTPPort      int
+	SMTPUsername  string
+	SMTPPassword  string
+	EmailFrom     string
+	EmailTo       string
+	CheckInterval time.Duration
 }
 
 func main() {
@@ -53,7 +54,12 @@ func main() {
 func loadConfig() Config {
 	websiteURL := getEnv("WEBSITE_URL", "")
 	searchText := getEnv("SEARCH_TEXT", "")
-	discordWebhook := getEnv("DISCORD_WEBHOOK", "")
+	smtpHost := getEnv("SMTP_HOST", "")
+	smtpPortStr := getEnv("SMTP_PORT", "587")
+	smtpUsername := getEnv("SMTP_USERNAME", "")
+	smtpPassword := getEnv("SMTP_PASSWORD", "")
+	emailFrom := getEnv("EMAIL_FROM", "")
+	emailTo := getEnv("EMAIL_TO", "")
 	intervalStr := getEnv("CHECK_INTERVAL", "5m")
 
 	if websiteURL == "" {
@@ -62,8 +68,19 @@ func loadConfig() Config {
 	if searchText == "" {
 		log.Fatal("SEARCH_TEXT environment variable is required")
 	}
-	if discordWebhook == "" {
-		log.Fatal("DISCORD_WEBHOOK environment variable is required")
+	if smtpHost == "" {
+		log.Fatal("SMTP_HOST environment variable is required")
+	}
+	if emailFrom == "" {
+		log.Fatal("EMAIL_FROM environment variable is required")
+	}
+	if emailTo == "" {
+		log.Fatal("EMAIL_TO environment variable is required")
+	}
+
+	smtpPort, err := strconv.Atoi(smtpPortStr)
+	if err != nil {
+		log.Fatalf("Invalid SMTP_PORT: %v", err)
 	}
 
 	interval, err := time.ParseDuration(intervalStr)
@@ -72,10 +89,15 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		WebsiteURL:     websiteURL,
-		SearchText:     searchText,
-		DiscordWebhook: discordWebhook,
-		CheckInterval:  interval,
+		WebsiteURL:    websiteURL,
+		SearchText:    searchText,
+		SMTPHost:      smtpHost,
+		SMTPPort:      smtpPort,
+		SMTPUsername:  smtpUsername,
+		SMTPPassword:  smtpPassword,
+		EmailFrom:     emailFrom,
+		EmailTo:       emailTo,
+		CheckInterval: interval,
 	}
 }
 
@@ -129,10 +151,10 @@ func checkWebsite(config Config) {
 	links := findLinksForText(doc, config.WebsiteURL, searchTextLower)
 
 	if len(links) > 0 {
-		sendDiscordNotification(config, config.SearchText, links)
+		sendEmailNotification(config, config.SearchText, links)
 	} else {
 		// If no specific links found, just use the base URL
-		sendDiscordNotification(config, config.SearchText, []string{config.WebsiteURL})
+		sendEmailNotification(config, config.SearchText, []string{config.WebsiteURL})
 	}
 }
 
@@ -294,38 +316,41 @@ func resolveURL(baseURL *url.URL, href string) string {
 	return resolved.String()
 }
 
-func sendDiscordNotification(config Config, matchText string, links []string) {
+func sendEmailNotification(config Config, matchText string, links []string) {
 	var linksText strings.Builder
 	if len(links) > 0 {
-		linksText.WriteString("\n\n**Links:**\n")
+		linksText.WriteString("\n\nLinks:\n")
 		for i, link := range links {
 			linksText.WriteString(fmt.Sprintf("%d. %s\n", i+1, link))
 		}
 	}
 
-	message := fmt.Sprintf("🔔 **Match Found!**\n\nWebsite: %s\nSearch text: %s\nTime: %s%s",
+	subject := fmt.Sprintf("Match Found: %s", matchText)
+	body := fmt.Sprintf("Match Found!\n\nWebsite: %s\nSearch text: %s\nTime: %s%s",
 		config.WebsiteURL, matchText, time.Now().Format("2006-01-02 15:04:05"), linksText.String())
 
-	webhook := DiscordWebhook{
-		Content: message,
+	// Setup message
+	message := fmt.Sprintf("From: %s\r\n", config.EmailFrom)
+	message += fmt.Sprintf("To: %s\r\n", config.EmailTo)
+	message += fmt.Sprintf("Subject: %s\r\n", subject)
+	message += "MIME-Version: 1.0\r\n"
+	message += "Content-Type: text/plain; charset=UTF-8\r\n"
+	message += "\r\n"
+	message += body
+
+	// Setup authentication (only if credentials are provided)
+	var auth smtp.Auth
+	if config.SMTPUsername != "" && config.SMTPPassword != "" {
+		auth = smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
 	}
 
-	jsonData, err := json.Marshal(webhook)
+	// Send email
+	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
+	err := smtp.SendMail(addr, auth, config.EmailFrom, []string{config.EmailTo}, []byte(message))
 	if err != nil {
-		log.Printf("Error marshaling webhook data: %v", err)
+		log.Printf("Error sending email: %v", err)
 		return
 	}
 
-	resp, err := http.Post(config.DiscordWebhook, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Printf("Error sending Discord notification: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		fmt.Printf("Discord notification sent successfully!\n")
-	} else {
-		log.Printf("Error: Discord webhook returned status code %d", resp.StatusCode)
-	}
+	fmt.Printf("Email notification sent successfully!\n")
 }

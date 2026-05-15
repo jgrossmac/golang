@@ -16,16 +16,26 @@ import (
 )
 
 type Config struct {
-	WebsiteURL     string
-	SearchText     string
-	SMTPHost       string
-	SMTPPort       int
-	SMTPUsername   string
-	SMTPPassword   string
-	EmailFrom      string
-	EmailTo        string
-	CheckInterval  time.Duration
-	RequireInStock bool
+	WebsiteURL        string
+	SearchText        string
+	SMTPHost          string
+	SMTPPort          int
+	SMTPUsername      string
+	SMTPPassword      string
+	EmailFrom         string
+	EmailTo           string
+	DiscordWebhookURL string
+	CheckInterval     time.Duration
+	RequireInStock    bool
+	MaxAge            time.Duration // 0 = no max-age filter
+}
+
+func (c Config) EmailEnabled() bool {
+	return c.SMTPHost != "" && c.EmailFrom != "" && c.EmailTo != ""
+}
+
+func (c Config) DiscordEnabled() bool {
+	return c.DiscordWebhookURL != ""
 }
 
 type shopifyVariant struct {
@@ -33,10 +43,11 @@ type shopifyVariant struct {
 }
 
 type shopifyProduct struct {
-	Title    string           `json:"title"`
-	Handle   string           `json:"handle"`
-	Tags     []string         `json:"tags"`
-	Variants []shopifyVariant `json:"variants"`
+	Title       string           `json:"title"`
+	Handle      string           `json:"handle"`
+	Tags        []string         `json:"tags"`
+	Variants    []shopifyVariant `json:"variants"`
+	PublishedAt time.Time        `json:"published_at"`
 }
 
 func (p shopifyProduct) InStock() bool {
@@ -62,6 +73,12 @@ func main() {
 	fmt.Printf("Search text: %s\n", config.SearchText)
 	fmt.Printf("Check interval: %v\n", config.CheckInterval)
 	fmt.Printf("Require in stock: %v\n", config.RequireInStock)
+	if config.MaxAge > 0 {
+		fmt.Printf("Max age: %v\n", config.MaxAge)
+	} else {
+		fmt.Printf("Max age: (disabled)\n")
+	}
+	fmt.Printf("Notifications: email=%v discord=%v\n", config.EmailEnabled(), config.DiscordEnabled())
 	fmt.Println()
 
 	checkCollection(config)
@@ -82,8 +99,10 @@ func loadConfig() Config {
 	smtpPassword := getEnv("SMTP_PASSWORD", "")
 	emailFrom := getEnv("EMAIL_FROM", "")
 	emailTo := getEnv("EMAIL_TO", "")
+	discordWebhookURL := getEnv("DISCORD_WEBHOOK_URL", "")
 	intervalStr := getEnv("CHECK_INTERVAL", "5m")
 	requireInStockStr := getEnv("REQUIRE_IN_STOCK", "false")
+	maxAgeStr := getEnv("MAX_AGE", "24h")
 
 	if websiteURL == "" {
 		log.Fatal("WEBSITE_URL environment variable is required")
@@ -91,14 +110,30 @@ func loadConfig() Config {
 	if searchText == "" {
 		log.Fatal("SEARCH_TEXT environment variable is required")
 	}
-	if smtpHost == "" {
-		log.Fatal("SMTP_HOST environment variable is required")
+
+	// Email is configured iff all three of SMTP_HOST, EMAIL_FROM, EMAIL_TO are set;
+	// partial configs are a mistake worth flagging.
+	emailFields := []struct{ name, value string }{
+		{"SMTP_HOST", smtpHost},
+		{"EMAIL_FROM", emailFrom},
+		{"EMAIL_TO", emailTo},
 	}
-	if emailFrom == "" {
-		log.Fatal("EMAIL_FROM environment variable is required")
+	var emailSet, emailMissing []string
+	for _, f := range emailFields {
+		if f.value != "" {
+			emailSet = append(emailSet, f.name)
+		} else {
+			emailMissing = append(emailMissing, f.name)
+		}
 	}
-	if emailTo == "" {
-		log.Fatal("EMAIL_TO environment variable is required")
+	if len(emailSet) > 0 && len(emailMissing) > 0 {
+		log.Fatalf("Partial email config: %v set but %v missing. Set all three or none.", emailSet, emailMissing)
+	}
+
+	emailEnabled := len(emailMissing) == 0
+	discordEnabled := discordWebhookURL != ""
+	if !emailEnabled && !discordEnabled {
+		log.Fatal("No notification channel configured. Set DISCORD_WEBHOOK_URL or all of SMTP_HOST/EMAIL_FROM/EMAIL_TO.")
 	}
 
 	smtpPort, err := strconv.Atoi(smtpPortStr)
@@ -116,17 +151,30 @@ func loadConfig() Config {
 		log.Fatalf("Invalid REQUIRE_IN_STOCK value %q: %v. Use 'true' or 'false'.", requireInStockStr, err)
 	}
 
+	var maxAge time.Duration
+	if maxAgeStr != "" {
+		maxAge, err = time.ParseDuration(maxAgeStr)
+		if err != nil {
+			log.Fatalf("Invalid MAX_AGE format: %v. Use format like '24h', '48h', '7d' (note: Go duration does not support 'd', use '168h' for 7 days).", err)
+		}
+		if maxAge <= 0 {
+			log.Fatalf("MAX_AGE must be a positive duration; got %v", maxAge)
+		}
+	}
+
 	return Config{
-		WebsiteURL:     websiteURL,
-		SearchText:     searchText,
-		SMTPHost:       smtpHost,
-		SMTPPort:       smtpPort,
-		SMTPUsername:   smtpUsername,
-		SMTPPassword:   smtpPassword,
-		EmailFrom:      emailFrom,
-		EmailTo:        emailTo,
-		CheckInterval:  interval,
-		RequireInStock: requireInStock,
+		WebsiteURL:        websiteURL,
+		SearchText:        searchText,
+		SMTPHost:          smtpHost,
+		SMTPPort:          smtpPort,
+		SMTPUsername:      smtpUsername,
+		SMTPPassword:      smtpPassword,
+		EmailFrom:         emailFrom,
+		EmailTo:           emailTo,
+		DiscordWebhookURL: discordWebhookURL,
+		CheckInterval:     interval,
+		RequireInStock:    requireInStock,
+		MaxAge:            maxAge,
 	}
 }
 
@@ -166,6 +214,13 @@ func checkCollection(config Config) {
 			fmt.Printf("Filtered out %d out-of-stock match(es).\n", dropped)
 		}
 	}
+	if config.MaxAge > 0 {
+		before := len(matches)
+		matches = filterByMaxAge(matches, time.Now(), config.MaxAge)
+		if dropped := before - len(matches); dropped > 0 {
+			fmt.Printf("Filtered out %d match(es) older than %v.\n", dropped, config.MaxAge)
+		}
+	}
 	if len(matches) == 0 {
 		fmt.Printf("No match found.\n")
 		return
@@ -176,7 +231,20 @@ func checkCollection(config Config) {
 	for _, p := range matches {
 		links = append(links, productURL(base, p.Handle)+"  ("+p.Title+")")
 	}
-	sendEmailNotification(config, config.SearchText, links)
+	notify(config, config.SearchText, links)
+}
+
+func notify(config Config, matchText string, links []string) {
+	if config.EmailEnabled() {
+		sendEmailNotification(config, matchText, links)
+	}
+	if config.DiscordEnabled() {
+		if err := sendDiscordNotification(config.DiscordWebhookURL, config.WebsiteURL, matchText, links); err != nil {
+			log.Printf("Error sending Discord notification: %v", err)
+		} else {
+			fmt.Printf("Discord notification sent successfully!\n")
+		}
+	}
 }
 
 func parseSearchTerms(s string) []string {
@@ -193,6 +261,23 @@ func filterInStock(products []shopifyProduct) []shopifyProduct {
 	out := make([]shopifyProduct, 0, len(products))
 	for _, p := range products {
 		if p.InStock() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// filterByMaxAge keeps only products whose PublishedAt is within maxAge of now.
+// Products with a zero PublishedAt (missing/unparseable in the JSON) are dropped
+// when the filter is active — we can't claim they're recent if we don't know.
+func filterByMaxAge(products []shopifyProduct, now time.Time, maxAge time.Duration) []shopifyProduct {
+	cutoff := now.Add(-maxAge)
+	out := make([]shopifyProduct, 0, len(products))
+	for _, p := range products {
+		if p.PublishedAt.IsZero() {
+			continue
+		}
+		if p.PublishedAt.After(cutoff) {
 			out = append(out, p)
 		}
 	}
@@ -257,6 +342,36 @@ func fetchAllProducts(collectionURL *url.URL) ([]shopifyProduct, error) {
 		}
 	}
 	return all, nil
+}
+
+func sendDiscordNotification(webhookURL, websiteURL, matchText string, links []string) error {
+	var body strings.Builder
+	fmt.Fprintf(&body, "**Match Found: %s**\n", matchText)
+	fmt.Fprintf(&body, "Site: %s\n", websiteURL)
+	fmt.Fprintf(&body, "Time: %s", time.Now().Format("2006-01-02 15:04:05"))
+	if len(links) > 0 {
+		body.WriteString("\n\n**Links:**")
+		for i, link := range links {
+			fmt.Fprintf(&body, "\n%d. %s", i+1, link)
+		}
+	}
+
+	payload, err := json.Marshal(map[string]string{"content": body.String()})
+	if err != nil {
+		return fmt.Errorf("encode payload: %w", err)
+	}
+
+	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		return fmt.Errorf("post webhook: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Discord returns 204 No Content on success; some webhook variants return 200.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("discord webhook returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func productURL(base *url.URL, handle string) string {

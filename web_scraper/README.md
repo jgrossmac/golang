@@ -92,16 +92,29 @@ prior HTML-scraping implementation.
 - `SEARCH_TEXT` (required): One or more search terms, comma-separated.
   A product matches if any term is a case-insensitive substring of its title.
   Examples: `patria`  or  `patria, garrison brothers, veuve clicquot`.
-- `SMTP_HOST` (required): SMTP server hostname (e.g., `smtp.gmail.com`)
-- `SMTP_PORT` (required): SMTP server port (e.g., `587` for TLS, `465` for SSL)
+- `SMTP_HOST` (required for email): SMTP server hostname (e.g., `smtp.gmail.com`)
+- `SMTP_PORT` (optional): SMTP server port. Default: `587` (TLS); `465` for SSL.
 - `SMTP_USERNAME` (optional): SMTP username (required for authenticated SMTP)
 - `SMTP_PASSWORD` (optional): SMTP password or app password (required for authenticated SMTP)
-- `EMAIL_FROM` (required): Email address to send from
-- `EMAIL_TO` (required): Email address to send to
+- `EMAIL_FROM` (required for email): Email address to send from
+- `EMAIL_TO` (required for email): Email address to send to
+- `DISCORD_WEBHOOK_URL` (optional): Discord webhook URL. If set, a Discord
+  notification is sent in addition to (or instead of) email. Create one in
+  Discord under Server Settings → Integrations → Webhooks.
 - `CHECK_INTERVAL` (optional): How often to check the website (e.g., "5m", "1h", "30s"). Default: "5m"
 - `REQUIRE_IN_STOCK` (optional): If `true`, only notify on products that have
   at least one available variant (`variants[].available == true` in the JSON).
   Default: `false`.
+- `MAX_AGE` (optional): If set, only notify on products whose `published_at`
+  timestamp is within this duration of "now". Useful to suppress repeat
+  notifications on items that have been in the collection for a while.
+  Format is Go's duration: `24h`, `48h`, `168h` (7 days), `30m`. Unset means
+  no age filter. Products with a missing `published_at` are excluded when
+  this filter is active.
+
+At least one notification channel must be configured — either `DISCORD_WEBHOOK_URL`
+or the full set of SMTP/email fields (`SMTP_HOST`, `EMAIL_FROM`, `EMAIL_TO`).
+If both are configured, notifications are sent to both.
 
 ### Check Interval Format
 

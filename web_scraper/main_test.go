@@ -3,12 +3,14 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMatchProducts_FindsByTitleSubstring(t *testing.T) {
@@ -100,6 +102,46 @@ func TestInStock(t *testing.T) {
 	}
 }
 
+func TestFilterByMaxAge(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+	products := []shopifyProduct{
+		{Handle: "fresh", PublishedAt: now.Add(-1 * time.Hour)},  // within 24h
+		{Handle: "edge", PublishedAt: now.Add(-24 * time.Hour)},  // exactly at cutoff
+		{Handle: "stale", PublishedAt: now.Add(-48 * time.Hour)}, // older than 24h
+		{Handle: "unknown"},                                      // zero PublishedAt
+	}
+	got := filterByMaxAge(products, now, 24*time.Hour)
+	if len(got) != 1 || got[0].Handle != "fresh" {
+		t.Fatalf("expected only 'fresh' (edge at exact cutoff is excluded; unknown dropped); got %+v", got)
+	}
+}
+
+func TestFilterByMaxAge_DropsZeroTime(t *testing.T) {
+	// A product with no PublishedAt is treated as "unknown age" and excluded when
+	// the filter is active. The alternative (including unknowns) would defeat the
+	// purpose of the filter.
+	now := time.Now()
+	products := []shopifyProduct{{Handle: "x"}}
+	if got := filterByMaxAge(products, now, 24*time.Hour); len(got) != 0 {
+		t.Fatalf("expected zero-time product to be dropped, got %+v", got)
+	}
+}
+
+func TestShopifyProduct_PublishedAtParsesFromJSON(t *testing.T) {
+	// The JSON shape Shopify actually returns, copied from the live missionliquor
+	// response captured earlier:
+	//   "published_at":"2026-05-14T05:56:37-07:00"
+	raw := `{"title":"X","handle":"x","published_at":"2026-05-14T05:56:37-07:00"}`
+	var p shopifyProduct
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	want := time.Date(2026, 5, 14, 5, 56, 37, 0, time.FixedZone("", -7*3600))
+	if !p.PublishedAt.Equal(want) {
+		t.Fatalf("PublishedAt = %v, want %v", p.PublishedAt, want)
+	}
+}
+
 func TestFilterInStock(t *testing.T) {
 	in := []shopifyProduct{
 		{Handle: "a", Variants: []shopifyVariant{{Available: true}}},
@@ -128,6 +170,98 @@ func TestMatchThenFilterInStock(t *testing.T) {
 	filtered := filterInStock(matched)
 	if len(filtered) != 1 || filtered[0].Handle != "patria-instock" {
 		t.Fatalf("expected only patria-instock after filter, got %+v", filtered)
+	}
+}
+
+// captureDiscordWebhook spins up a fake Discord webhook endpoint that records the
+// request method, content-type, and decoded JSON body. The handler returns the
+// status code provided (Discord normally returns 204 No Content).
+func captureDiscordWebhook(t *testing.T, status int) (url string, gotMethod, gotContentType *string, gotBody *map[string]string) {
+	t.Helper()
+	var method, ct string
+	body := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		ct = r.Header.Get("Content-Type")
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, &method, &ct, &body
+}
+
+func TestSendDiscordNotification_PostsJSONContent(t *testing.T) {
+	whURL, method, ct, body := captureDiscordWebhook(t, http.StatusNoContent)
+
+	err := sendDiscordNotification(
+		whURL,
+		"https://store.example.com/collections/new-arrivals",
+		"patria",
+		[]string{"https://store.example.com/products/patria  (Patria Avoyelles 2022 750ml)"},
+	)
+	if err != nil {
+		t.Fatalf("sendDiscordNotification: %v", err)
+	}
+	if *method != "POST" {
+		t.Errorf("expected POST, got %s", *method)
+	}
+	if *ct != "application/json" {
+		t.Errorf("expected application/json content-type, got %q", *ct)
+	}
+	content, ok := (*body)["content"]
+	if !ok {
+		t.Fatalf("payload missing 'content' field: %+v", *body)
+	}
+	// Sanity-check the message includes the match text, site, and the link.
+	for _, want := range []string{"Match Found: patria", "store.example.com/collections/new-arrivals", "Patria Avoyelles 2022 750ml"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("discord content missing %q; got:\n%s", want, content)
+		}
+	}
+}
+
+// Discord sometimes returns 200 instead of 204; either should be treated as success.
+func TestSendDiscordNotification_AcceptsAny2xx(t *testing.T) {
+	for _, status := range []int{200, 204} {
+		whURL, _, _, _ := captureDiscordWebhook(t, status)
+		if err := sendDiscordNotification(whURL, "https://x", "t", nil); err != nil {
+			t.Errorf("status %d: expected success, got %v", status, err)
+		}
+	}
+}
+
+func TestSendDiscordNotification_ErrorsOnNon2xx(t *testing.T) {
+	whURL, _, _, _ := captureDiscordWebhook(t, http.StatusBadRequest)
+	err := sendDiscordNotification(whURL, "https://x", "t", nil)
+	if err == nil {
+		t.Fatal("expected error on 400 response, got nil")
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Errorf("expected error to mention status code, got: %v", err)
+	}
+}
+
+func TestConfigEnabledHelpers(t *testing.T) {
+	cases := []struct {
+		name             string
+		c                Config
+		wantEmail        bool
+		wantDiscord      bool
+	}{
+		{"nothing set", Config{}, false, false},
+		{"only discord", Config{DiscordWebhookURL: "https://x"}, false, true},
+		{"only email", Config{SMTPHost: "h", EmailFrom: "f", EmailTo: "t"}, true, false},
+		{"both", Config{SMTPHost: "h", EmailFrom: "f", EmailTo: "t", DiscordWebhookURL: "https://x"}, true, true},
+		{"partial email (missing To)", Config{SMTPHost: "h", EmailFrom: "f"}, false, false},
+	}
+	for _, c := range cases {
+		if got := c.c.EmailEnabled(); got != c.wantEmail {
+			t.Errorf("%s: EmailEnabled() = %v, want %v", c.name, got, c.wantEmail)
+		}
+		if got := c.c.DiscordEnabled(); got != c.wantDiscord {
+			t.Errorf("%s: DiscordEnabled() = %v, want %v", c.name, got, c.wantDiscord)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/smtp"
@@ -302,6 +303,29 @@ func matchProducts(products []shopifyProduct, terms []string) []shopifyProduct {
 	return matches
 }
 
+// http.DefaultClient has no timeout, so a stalled connection would hang a
+// check until the process is restarted.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// refusalDetail summarises a non-200 so a 403 says why. Stores explain
+// themselves in the body and headers, and both were being discarded.
+func refusalDetail(resp *http.Response) string {
+	var parts []string
+	for _, h := range []string{"Retry-After", "Server", "CF-Ray", "CF-Mitigated", "X-Request-Id"} {
+		if v := resp.Header.Get(h); v != "" {
+			parts = append(parts, h+"="+v)
+		}
+	}
+	excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+	if s := strings.Join(strings.Fields(string(excerpt)), " "); s != "" {
+		parts = append(parts, "body="+strconv.Quote(s))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, " ") + ")"
+}
+
 func fetchAllProducts(collectionURL *url.URL) ([]shopifyProduct, error) {
 	const pageLimit = 250
 	var all []shopifyProduct
@@ -318,15 +342,17 @@ func fetchAllProducts(collectionURL *url.URL) ([]shopifyProduct, error) {
 			return nil, err
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; web_scraper/1.0)")
+		req.Header.Set("Accept", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return nil, err
 		}
 		body := resp.Body
 		if resp.StatusCode != http.StatusOK {
+			detail := refusalDetail(resp)
 			body.Close()
-			return nil, fmt.Errorf("status %d for %s", resp.StatusCode, jsonURL.String())
+			return nil, fmt.Errorf("status %d for %s%s", resp.StatusCode, jsonURL.String(), detail)
 		}
 
 		var parsed shopifyResponse

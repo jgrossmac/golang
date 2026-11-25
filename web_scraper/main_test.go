@@ -108,7 +108,7 @@ func TestFilterByMaxAge(t *testing.T) {
 		{Handle: "fresh", PublishedAt: now.Add(-1 * time.Hour)},  // within 24h
 		{Handle: "edge", PublishedAt: now.Add(-24 * time.Hour)},  // exactly at cutoff
 		{Handle: "stale", PublishedAt: now.Add(-48 * time.Hour)}, // older than 24h
-		{Handle: "unknown"},                                      // zero PublishedAt
+		{Handle: "unknown"}, // zero PublishedAt
 	}
 	got := filterByMaxAge(products, now, 24*time.Hour)
 	if len(got) != 1 || got[0].Handle != "fresh" {
@@ -244,10 +244,10 @@ func TestSendDiscordNotification_ErrorsOnNon2xx(t *testing.T) {
 
 func TestConfigEnabledHelpers(t *testing.T) {
 	cases := []struct {
-		name             string
-		c                Config
-		wantEmail        bool
-		wantDiscord      bool
+		name        string
+		c           Config
+		wantEmail   bool
+		wantDiscord bool
 	}{
 		{"nothing set", Config{}, false, false},
 		{"only discord", Config{DiscordWebhookURL: "https://x"}, false, true},
@@ -391,5 +391,97 @@ func TestFetchAndMatch_EndToEnd(t *testing.T) {
 	gotURL := productURL(base, matches[0].Handle)
 	if !strings.HasSuffix(gotURL, "/products/p-42") {
 		t.Fatalf("unexpected product URL: %q", gotURL)
+	}
+}
+
+func TestFetchAllProducts_RefusalIncludesReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Server", "cloudflare")
+		w.Header().Set("CF-Ray", "8f2a1b3c4d5e6f70-LAX")
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("<html><title>Just a moment...</title>\n  <body>checking your browser</body></html>"))
+	}))
+	defer srv.Close()
+	base, err := url.Parse(srv.URL + "/collections/new")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	_, err = fetchAllProducts(base)
+	if err == nil {
+		t.Fatal("expected an error for 403")
+	}
+	msg := err.Error()
+	for _, want := range []string{"status 403", "Retry-After=120", "Server=cloudflare", "CF-Ray=", "Just a moment"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+func TestRefusalDetail_EmptyWhenNothingToReport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Server"] = nil
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer srv.Close()
+	base, err := url.Parse(srv.URL + "/collections/new")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	_, err = fetchAllProducts(base)
+	if err == nil {
+		t.Fatal("expected an error for 418")
+	}
+	if !strings.Contains(err.Error(), "status 418") {
+		t.Errorf("want status in error, got %s", err.Error())
+	}
+}
+
+func TestRefusalDetail_BodyExcerptIsBounded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(strings.Repeat("x", 10000)))
+	}))
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/collections/new")
+
+	_, err := fetchAllProducts(base)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	// 300 bytes of body, plus the status, URL and quoting.
+	if len(err.Error()) > 700 {
+		t.Errorf("error should stay bounded, got %d chars", len(err.Error()))
+	}
+}
+
+func TestHTTPClientHasTimeout(t *testing.T) {
+	if httpClient.Timeout == 0 {
+		t.Fatal("httpClient must have a timeout; a stalled store would hang the check loop")
+	}
+}
+
+func TestFetchAllProducts_SendsHeaders(t *testing.T) {
+	var gotUA, gotAccept string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		gotAccept = r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"products":[]}`))
+	}))
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/collections/new")
+
+	if _, err := fetchAllProducts(base); err != nil {
+		t.Fatalf("fetchAllProducts: %v", err)
+	}
+	if !strings.Contains(gotUA, "web_scraper") {
+		t.Errorf("User-Agent should identify the scraper, got %q", gotUA)
+	}
+	if gotAccept != "application/json" {
+		t.Errorf("Accept = %q, want application/json", gotAccept)
 	}
 }
